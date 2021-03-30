@@ -19,6 +19,8 @@
 #include "protocols/xdg-shell.h"
 #include "protocols/wlr-layer-shell-unstable-v1-client-header.h"
 #include "protocols/wlr-layer-shell-unstable-v1.h"
+#include "protocols/wlr-foreign-toplevel-management-unstable-v1-client-header.h"
+#include "protocols/wlr-foreign-toplevel-management-unstable-v1.h"
 #include "protocols/idle-client-header.h"
 #include "protocols/idle.h"
 #include "pool-buffer.h"
@@ -29,6 +31,8 @@
 #include "../queues.h"
 #include "../input.h"
 #include "libgwater-wayland.h"
+
+#define MAX_TOUCHPOINTS 10
 
 struct window_wl {
         cairo_surface_t *c_surface;
@@ -54,6 +58,7 @@ struct wl_ctx {
         struct wl_callback *frame_callback;
         struct org_kde_kwin_idle *idle_handler;
         struct org_kde_kwin_idle_timeout *idle_timeout;
+        struct zwlr_foreign_toplevel_manager_v1 *toplevel_manager;
         bool configured;
         bool dirty;
         bool is_idle;
@@ -63,6 +68,13 @@ struct wl_ctx {
                 struct wl_pointer *wl_pointer;
                 int32_t x, y;
         } pointer;
+
+	struct {
+		struct wl_touch *wl_touch;
+		struct {
+			int32_t x, y;
+		} pts[MAX_TOUCHPOINTS];
+	} touch;
 
         struct dimensions cur_dim;
 
@@ -79,8 +91,9 @@ struct dunst_output {
 
         uint32_t scale;
         uint32_t subpixel; // TODO do something with it
+        bool fullscreen;
+        struct zwlr_foreign_toplevel_handle_v1 *fullscreen_toplevel; // the toplevel that is fullscreened on this output
 };
-
 
 struct wl_ctx ctx;
 
@@ -124,6 +137,7 @@ static void create_output( struct wl_output *wl_output, uint32_t global_name) {
         output->wl_output = wl_output;
         // TODO: Fix this
         output->scale = 1;
+        output->fullscreen = false;
         wl_list_insert(&ctx.outputs, &output->link);
 
         wl_output_set_user_data(wl_output, output);
@@ -144,7 +158,36 @@ static void destroy_output(struct dunst_output *output) {
         free(output);
 }
 
-// FIXME: Snipped touch handling
+static void touch_handle_motion(void *data, struct wl_touch *wl_touch,
+                uint32_t time, int32_t id,
+                wl_fixed_t surface_x, wl_fixed_t surface_y) {
+        if (id >= MAX_TOUCHPOINTS) {
+                return;
+        }
+        ctx.touch.pts[id].x = wl_fixed_to_int(surface_x);
+        ctx.touch.pts[id].y = wl_fixed_to_int(surface_y);
+}
+
+static void touch_handle_down(void *data, struct wl_touch *wl_touch,
+                uint32_t serial, uint32_t time, struct wl_surface *sfc, int32_t id,
+                wl_fixed_t surface_x, wl_fixed_t surface_y) {
+        if (id >= MAX_TOUCHPOINTS) {
+                return;
+        }
+        ctx.touch.pts[id].x = wl_fixed_to_int(surface_x);
+        ctx.touch.pts[id].y = wl_fixed_to_int(surface_y);
+}
+
+static void touch_handle_up(void *data, struct wl_touch *wl_touch,
+                uint32_t serial, uint32_t time, int32_t id) {
+        if (id >= MAX_TOUCHPOINTS) {
+                return;
+        }
+        input_handle_click(BTN_TOUCH, false,
+                        ctx.touch.pts[id].x, ctx.touch.pts[id].y);
+
+}
+
 static void pointer_handle_motion(void *data, struct wl_pointer *wl_pointer,
                 uint32_t time, wl_fixed_t surface_x, wl_fixed_t surface_y) {
         ctx.pointer.x = wl_fixed_to_int(surface_x);
@@ -165,7 +208,13 @@ static const struct wl_pointer_listener pointer_listener = {
         .axis = noop,
 };
 
-// FIXME snipped touch listener
+static const struct wl_touch_listener touch_listener = {
+        .down = touch_handle_down,
+        .up = touch_handle_up,
+        .motion = touch_handle_motion,
+        .frame = noop,
+        .cancel = noop,
+};
 
 static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat,
                 uint32_t capabilities) {
@@ -179,6 +228,15 @@ static void seat_handle_capabilities(void *data, struct wl_seat *wl_seat,
                 wl_pointer_add_listener(ctx.pointer.wl_pointer,
                         &pointer_listener, ctx.seat);
                 LOG_I("Adding pointer");
+        }
+        if (ctx.touch.wl_touch != NULL) {
+                wl_touch_release(ctx.touch.wl_touch);
+                ctx.touch.wl_touch = NULL;
+        }
+        if (capabilities & WL_SEAT_CAPABILITY_TOUCH) {
+                ctx.touch.wl_touch = wl_seat_get_touch(wl_seat);
+                wl_touch_add_listener(ctx.touch.wl_touch,
+                        &touch_listener, ctx.seat);
         }
 }
 
@@ -257,11 +315,11 @@ static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
 
 static void idle_start (void *data, struct org_kde_kwin_idle_timeout *org_kde_kwin_idle_timeout) {
         ctx.is_idle = true;
-        LOG_I("User went idle");
+        LOG_D("User went idle");
 }
 static void idle_stop (void *data, struct org_kde_kwin_idle_timeout *org_kde_kwin_idle_timeout) {
         ctx.is_idle = false;
-        LOG_I("User isn't idle anymore");
+        LOG_D("User isn't idle anymore");
 }
 
 static const struct org_kde_kwin_idle_timeout_listener idle_timeout_listener = {
@@ -273,34 +331,174 @@ static void add_seat_to_idle_handler(struct wl_seat *seat) {
         if (!ctx.idle_handler){
                 return;
         }
-        uint32_t timeout_ms = settings.idle_threshold/1000;
-        ctx.idle_timeout = org_kde_kwin_idle_get_idle_timeout(ctx.idle_handler, seat, timeout_ms);
-        org_kde_kwin_idle_timeout_add_listener(ctx.idle_timeout, &idle_timeout_listener, 0);
-        ctx.has_idle_monitor = true;
+        if (settings.idle_threshold > 0) {
+                uint32_t timeout_ms = settings.idle_threshold/1000;
+                ctx.idle_timeout = org_kde_kwin_idle_get_idle_timeout(ctx.idle_handler, seat, timeout_ms);
+                org_kde_kwin_idle_timeout_add_listener(ctx.idle_timeout, &idle_timeout_listener, 0);
+                ctx.has_idle_monitor = true;
+        }
 }
+
+// Warning, can return NULL
+static struct dunst_output *get_configured_output() {
+
+        switch (settings.f_mode){
+                case FOLLOW_NONE: ; // this semicolon is neccesary
+                        int n = 0;
+                        int target_monitor = settings.monitor;
+
+                        struct dunst_output *output;
+                        wl_list_for_each(output, &ctx.outputs, link) {
+                                if (n == target_monitor)
+                                        return output;
+                                n++;
+                        }
+                        LOG_W("Monitor %i doesn't exist, using focused monitor", settings.monitor);
+                        return NULL;
+                case FOLLOW_MOUSE:
+                        // fallthrough
+                case FOLLOW_KEYBOARD:
+                        // fallthrough
+                default:
+                        return NULL;
+        }
+}
+
+// does not do null checking
+static void dunst_output_set_fullscreen(struct dunst_output *output,
+                struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                bool fullscreen) {
+        output->fullscreen = fullscreen;
+        if (fullscreen)
+                output->fullscreen_toplevel = toplevel;
+        else
+                output->fullscreen_toplevel = NULL;
+
+        LOG_D("Set output %i fullscreen state %i", output->global_name, fullscreen);
+        wake_up();
+}
+
+static void toplevel_output_leave(void *data,
+                struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                struct wl_output *output) {
+        zwlr_foreign_toplevel_handle_v1_set_user_data(toplevel, NULL);
+}
+
+static void toplevel_output_enter(void *data,
+                struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                struct wl_output *output) {
+        // FIXME toplevel can be on multiple outputs, so a list of outputs should be kept
+        zwlr_foreign_toplevel_handle_v1_set_user_data(toplevel, output);
+}
+
+static void toplevel_closed(void *data,
+                struct zwlr_foreign_toplevel_handle_v1 *toplevel) {
+        struct wl_output *output_wl = (struct wl_output*) data;
+
+        if (output_wl == NULL) {
+                return;
+        }
+        struct dunst_output *output = (struct dunst_output*) wl_output_get_user_data(output_wl);
+
+        if (output == NULL) {
+                return;
+        }
+        dunst_output_set_fullscreen(output, toplevel, false);
+}
+
+static void toplevel_state(void *data,
+                struct zwlr_foreign_toplevel_handle_v1 *toplevel,
+                struct wl_array *state) {
+        struct wl_output *output_wl = (struct wl_output*) data;
+        if (output_wl == NULL) {
+                return;
+        }
+        struct dunst_output *output = (struct dunst_output*) wl_output_get_user_data(output_wl);
+        if (output == NULL) {
+                return;
+        }
+
+        bool fullscreen = false;
+        bool activated = false;
+        enum zwlr_foreign_toplevel_handle_v1_state* element;
+        wl_array_for_each(element, state){
+                if (*element == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_FULLSCREEN) {
+                        fullscreen = true;
+                }
+                if (*element == ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_ACTIVATED) {
+                        activated = true;
+                }
+        }
+        if (fullscreen && activated) {
+                dunst_output_set_fullscreen(output, toplevel, true);
+
+        } else {
+                if (output->fullscreen_toplevel == toplevel) {
+                        // this toplevel was fullscreen, but isn't anymore
+                        dunst_output_set_fullscreen(output, toplevel, false);
+                }
+        }
+}
+
+static const struct zwlr_foreign_toplevel_handle_v1_listener foreign_toplevel_handle_listener = {
+        .title = noop,
+        .app_id = noop,
+        .output_enter = toplevel_output_enter,
+        .output_leave = toplevel_output_leave,
+        .state = toplevel_state,
+        .done = noop,
+        .closed = toplevel_closed,
+};
+
+static void toplevel_created(void *data,
+                struct zwlr_foreign_toplevel_manager_v1 *zwlr_foreign_toplevel_manager_v1,
+                struct zwlr_foreign_toplevel_handle_v1 *toplevel){
+        zwlr_foreign_toplevel_handle_v1_add_listener(toplevel, &foreign_toplevel_handle_listener, NULL);
+}
+
+static void toplevel_finished(void *data,
+                struct zwlr_foreign_toplevel_manager_v1 *zwlr_foreign_toplevel_manager_v1){
+}
+
+static const struct zwlr_foreign_toplevel_manager_v1_listener foreign_toplevel_manager_listener = {
+        .toplevel = toplevel_created,
+        .finished = toplevel_finished,
+};
 
 static void handle_global(void *data, struct wl_registry *registry,
                 uint32_t name, const char *interface, uint32_t version) {
-        if (strcmp(interface, wl_compositor_interface.name) == 0) {
-                ctx.compositor = wl_registry_bind(registry, name,
-                        &wl_compositor_interface, 4);
-        } else if (strcmp(interface, wl_shm_interface.name) == 0) {
-                ctx.shm = wl_registry_bind(registry, name,
-                        &wl_shm_interface, 1);
-        } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
-                ctx.layer_shell = wl_registry_bind(registry, name,
-                        &zwlr_layer_shell_v1_interface, 1);
-        } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-                ctx.seat = wl_registry_bind(registry, name, &wl_seat_interface, 3);
-                wl_seat_add_listener(ctx.seat, &seat_listener, ctx.seat);
-                add_seat_to_idle_handler(ctx.seat);
-        } else if (strcmp(interface, wl_output_interface.name) == 0) {
-                struct wl_output *output =
-                        wl_registry_bind(registry, name, &wl_output_interface, 3);
-                create_output(output, name);
-        } else if (strcmp(interface, org_kde_kwin_idle_interface.name) == 0 &&
-                        version >= ORG_KDE_KWIN_IDLE_TIMEOUT_IDLE_SINCE_VERSION) {
-                ctx.idle_handler = wl_registry_bind(registry, name, &org_kde_kwin_idle_interface, 1);
+        int *count = data;
+        if (*count == 0)
+        {
+                if (strcmp(interface, wl_compositor_interface.name) == 0) {
+                        ctx.compositor = wl_registry_bind(registry, name,
+                                        &wl_compositor_interface, 4);
+                } else if (strcmp(interface, wl_shm_interface.name) == 0) {
+                        ctx.shm = wl_registry_bind(registry, name,
+                                        &wl_shm_interface, 1);
+                } else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+                        ctx.layer_shell = wl_registry_bind(registry, name,
+                                        &zwlr_layer_shell_v1_interface, 1);
+                } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+                        ctx.seat = wl_registry_bind(registry, name, &wl_seat_interface, 3);
+                        wl_seat_add_listener(ctx.seat, &seat_listener, ctx.seat);
+                        add_seat_to_idle_handler(ctx.seat);
+                } else if (strcmp(interface, wl_output_interface.name) == 0) {
+                        struct wl_output *output =
+                                wl_registry_bind(registry, name, &wl_output_interface, 3);
+                        create_output(output, name);
+                } else if (strcmp(interface, org_kde_kwin_idle_interface.name) == 0 &&
+                                version >= ORG_KDE_KWIN_IDLE_TIMEOUT_IDLE_SINCE_VERSION) {
+                        ctx.idle_handler = wl_registry_bind(registry, name, &org_kde_kwin_idle_interface, 1);
+                }
+        } else {
+                if (strcmp(interface, zwlr_foreign_toplevel_manager_v1_interface.name) == 0 &&
+                                version >= ZWLR_FOREIGN_TOPLEVEL_HANDLE_V1_STATE_FULLSCREEN_SINCE_VERSION) {
+                        // Only bind after the second pass to bind after binding to all the outputs.
+                        // This is because otherwise toplevel_enter evens won't be sent.
+                        ctx.toplevel_manager = wl_registry_bind(registry, name, &zwlr_foreign_toplevel_manager_v1_interface, 2);
+                        zwlr_foreign_toplevel_manager_v1_add_listener(ctx.toplevel_manager, &foreign_toplevel_manager_listener, NULL);
+                }
         }
 }
 
@@ -320,31 +518,38 @@ static const struct wl_registry_listener registry_listener = {
         .global_remove = handle_global_remove,
 };
 
-bool init_wayland() {
+bool wl_init() {
         wl_list_init(&ctx.outputs);
-        //wl_list_init(&ctx.seats);
+        //wl_list_init(&ctx.seats); // TODO multi-seat support
 
         ctx.display = wl_display_connect(NULL);
 
         if (ctx.display == NULL) {
-                LOG_E("failed to create display");
+                LOG_W("failed to create display");
                 return false;
         }
 
+        int count = 0;
         ctx.registry = wl_display_get_registry(ctx.display);
-        wl_registry_add_listener(ctx.registry, &registry_listener, NULL);
+        wl_registry_add_listener(ctx.registry, &registry_listener, &count);
+        wl_display_roundtrip(ctx.display);
+
+        count = 1;
+        // we need a second pass to let for foreign_toplevel (look there for more info)
+        ctx.registry = wl_display_get_registry(ctx.display);
+        wl_registry_add_listener(ctx.registry, &registry_listener, &count);
         wl_display_roundtrip(ctx.display);
 
         if (ctx.compositor == NULL) {
-                LOG_E("compositor doesn't support wl_compositor");
+                LOG_W("compositor doesn't support wl_compositor");
                 return false;
         }
         if (ctx.shm == NULL) {
-                LOG_E("compositor doesn't support wl_shm");
+                LOG_W("compositor doesn't support wl_shm");
                 return false;
         }
         if (ctx.layer_shell == NULL) {
-                LOG_E("compositor doesn't support zwlr_layer_shell_v1");
+                LOG_W("compositor doesn't support zwlr_layer_shell_v1");
                 return false;
         }
         if (ctx.seat == NULL) {
@@ -359,10 +564,17 @@ bool init_wayland() {
                 }
         }
 
+        if (ctx.toplevel_manager == NULL) {
+                LOG_W("compositor doesn't support zwlr_foreign_toplevel_v1. Fullscreen detection won't work");
+        }
+
         return true;
 }
 
-void finish_wayland() {
+void wl_deinit() {
+        // We need to check if any of these are NULL, since the initialization
+        // could have been aborted half way through, or the compositor doesn't
+        // support some of these features.
         if (ctx.layer_surface != NULL) {
                 zwlr_layer_surface_v1_destroy(ctx.layer_surface);
         }
@@ -372,49 +584,40 @@ void finish_wayland() {
         finish_buffer(&ctx.buffers[0]);
         finish_buffer(&ctx.buffers[1]);
 
+        // The output list is initialized at the start of init, so no need to
+        // check for NULL
         struct dunst_output *output, *output_tmp;
         wl_list_for_each_safe(output, output_tmp, &ctx.outputs, link) {
                 destroy_output(output);
         }
 
         if (ctx.seat) {
-                wl_pointer_release(ctx.pointer.wl_pointer);
+                if (ctx.pointer.wl_pointer)
+                        wl_pointer_release(ctx.pointer.wl_pointer);
                 wl_seat_release(ctx.seat);
                 ctx.seat = NULL;
         }
 
-        zwlr_layer_shell_v1_destroy(ctx.layer_shell);
-        wl_compositor_destroy(ctx.compositor);
-        wl_shm_destroy(ctx.shm);
-        wl_registry_destroy(ctx.registry);
-        wl_display_disconnect(ctx.display);
+        if (ctx.idle_handler)
+                org_kde_kwin_idle_destroy(ctx.idle_handler);
 
-        org_kde_kwin_idle_destroy(ctx.idle_handler);
-        org_kde_kwin_idle_timeout_release(ctx.idle_timeout);
-}
+        if (ctx.idle_timeout)
+                org_kde_kwin_idle_timeout_release(ctx.idle_timeout);
 
-static struct dunst_output *get_configured_output() {
-        struct dunst_output *output;
+        if (ctx.layer_shell)
+                zwlr_layer_shell_v1_destroy(ctx.layer_shell);
 
-        switch (settings.f_mode){
-                case FOLLOW_NONE: ; // this semicolon is neccesary
-                        int n = 0;
-                        int target_monitor = settings.monitor;
+        if (ctx.compositor)
+                wl_compositor_destroy(ctx.compositor);
 
-                        wl_list_for_each(output, &ctx.outputs, link) {
-                                if (n == target_monitor)
-                                        return output;
-                                n++;
-                        }
-                        LOG_W("Monitor %i doesn't exist, using focused monitor", settings.monitor);
-                        return NULL;
-                case FOLLOW_MOUSE:
-                        // fallthrough
-                case FOLLOW_KEYBOARD:
-                        // fallthrough
-                default:
-                        return NULL;
-        }
+        if (ctx.shm)
+                wl_shm_destroy(ctx.shm);
+
+        if (ctx.registry)
+                wl_registry_destroy(ctx.registry);
+
+        if (ctx.display)
+                wl_display_disconnect(ctx.display);
 }
 
 static void schedule_frame_and_commit();
@@ -455,6 +658,9 @@ static void send_frame() {
         // different output), we need to create it.
         if (ctx.layer_surface == NULL) {
                 struct wl_output *wl_output = NULL;
+                if (output != NULL) {
+                        wl_output = output->wl_output;
+                }
                 ctx.layer_surface_output = output;
                 ctx.surface = wl_compositor_create_surface(ctx.compositor);
                 wl_surface_add_listener(ctx.surface, &surface_listener, NULL);
@@ -582,13 +788,6 @@ void set_dirty() {
         schedule_frame_and_commit();
 }
 
-void wl_init(void) {
-        init_wayland();
-}
-
-void wl_deinit(void) {
-}
-
 window wl_win_create(void) {
         struct window_wl *win = g_malloc0(sizeof(struct window_wl));
 
@@ -605,6 +804,8 @@ void wl_win_destroy(window winptr) {
 }
 
 void wl_win_show(window win) {
+        // This is here for compatibilty with the X11 output. The window is
+        // already shown in wl_display_surface.
 }
 
 void wl_win_hide(window win) {
@@ -629,10 +830,6 @@ void wl_display_surface(cairo_surface_t *srf, window winptr, const struct dimens
 
         set_dirty();
         wl_display_roundtrip(ctx.display);
-}
-
-bool wl_win_visible(window win) {
-        return true;
 }
 
 cairo_t* wl_win_get_context(window winptr) {
@@ -666,7 +863,26 @@ bool wl_is_idle(void) {
                 return ctx.is_idle;
         }
 }
+
 bool wl_have_fullscreen_window(void) {
-        return false;
+        bool have_fullscreen = false;
+
+        struct dunst_output *current_output = get_configured_output();
+
+        if (!current_output) {
+                // Cannot detect focused output, so return true if any of the
+                // outputs is fullscreen. This will work even when unfocused
+                // outputs have fullscreen toplevels, since a toplevel has to
+                // be fullscreen and activate to consider an output fullscreen.
+                struct dunst_output *output;
+                wl_list_for_each(output, &ctx.outputs, link) {
+                        have_fullscreen |= output->fullscreen;
+                }
+        } else {
+                have_fullscreen = current_output->fullscreen;
+        }
+
+        LOG_D("Fullscreen queried: %i", have_fullscreen);
+        return have_fullscreen;
 }
 /* vim: set ft=c tabstop=8 shiftwidth=8 expandtab textwidth=0: */
